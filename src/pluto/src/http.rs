@@ -117,6 +117,16 @@ pub enum HttpBody {
     Raw(Vec<u8>),
 }
 
+impl HttpBody {
+    pub fn empty() -> Self {
+        return Self::Raw(Vec::new())
+    }
+}
+
+impl Default for HttpBody {
+    fn default() -> Self {Self::Raw(Vec::new())}
+}
+
 impl From<HttpBody> for Vec<u8> {
     fn from(b: HttpBody) -> Self {
         return match b {
@@ -460,6 +470,43 @@ impl HttpServe {
         self.cors_policy = Some(cors_policy);
     }
 
+    pub async fn handle_options(self, req: &RawHttpRequest) -> Option<RawHttpResponse>{
+        let router_clone = self.router.clone();
+        let path = Self::get_path(&req.url);
+        let allow = router_clone.allowed(path);
+
+        if allow.is_empty() {
+            return None;
+        }
+
+        return match self.router.global_options {
+            Some(ref handler) => {
+                let req = req.clone().into();
+                let handle_res = handler.handler.handle(req).await;
+                let mut raw_res =
+                    Into::<RawHttpResponse>::into(Self::unwrap_response(handle_res));
+                raw_res.set_upgrade(handler.upgrade);
+                Some(raw_res)
+            }
+            None => {
+                let mut res = HttpResponse {
+                    status_code: 204,
+                    headers: HashMap::new(),
+                    body: HttpBody::default(),
+                };
+                self.use_res_plugins(&mut res);
+                if res.headers.get("Access-Control-Allow-Methods").is_none() {
+                    res.headers.insert(
+                        "Access-Control-Allow-Methods".to_string(),
+                        allow.join(","),
+                    );
+                }
+
+                return Some(res.into());
+            }
+        };
+    }
+
     /// Serve the request.
     /// It will return a RawHttpResponse.
     /// It will return an internal server error if the request is not valid.
@@ -489,65 +536,28 @@ impl HttpServe {
     /// }
     /// ```
     pub async fn serve(self, req: RawHttpRequest) -> RawHttpResponse {
-        match Method::from_str(req.method.as_ref()) {
-            Err(_) => Self::internal_server_error().unwrap_err().into(),
-            Ok(method) => {
-                let path = Self::get_path(req.url.as_ref());
-                match self.router.clone().lookup(method, path) {
-                    Err(message) => {
-                        // Handle OPTIONS request
-                        if req.method == Method::OPTIONS.to_string() && self.router.handle_options {
-                            let router_clone = self.router.clone();
-                            let allow = router_clone.allowed(path);
-
-                            if !allow.is_empty() {
-                                return match self.router.global_options {
-                                    Some(ref handler) => {
-                                        let handle_res = handler.handler.handle(req.into()).await;
-                                        let mut raw_res: RawHttpResponse =
-                                            Self::unwrap_response(handle_res).into();
-                                        raw_res.set_upgrade(handler.upgrade);
-                                        raw_res
-                                    }
-                                    None => {
-                                        let mut res = HttpResponse {
-                                            status_code: 204,
-                                            headers: HashMap::new(),
-                                            body: "".to_string().into(),
-                                        };
-                                        self.use_res_plugins(&mut res);
-                                        if let None =
-                                            res.headers.get("Access-Control-Allow-Methods")
-                                        {
-                                            res.headers.insert(
-                                                "Access-Control-Allow-Methods".to_string(),
-                                                allow.join(","),
-                                            );
-                                        }
-
-                                        return res.into();
-                                    }
-                                };
-                            }
-                        }
-
-                        return Self::not_found_error(message).unwrap_err().into();
-                    }
-                    Ok(lookup) => {
-                        let upgrade = lookup.value.upgrade;
-                        if self.is_query && upgrade {
-                            let mut err: RawHttpResponse =
-                                Self::internal_server_error().unwrap_err().into();
-                            err.set_upgrade(upgrade);
-                            return err;
-                        }
-                        let res = self
-                            .build_and_execute_request(req.clone(), path, lookup, upgrade)
-                            .await;
-                        return res;
-                    }
-                }
-            }
+        let method = Method::from_str(req.method.as_ref());
+        if method.is_err() {
+            return Self::internal_server_error().unwrap_err().into()
         }
-    }
+        let method = method.unwrap();
+        let path = Self::get_path(&req.url);
+        let router = self.router.clone();
+        let lookup = router.lookup(method, path);
+        if let Err(message) = &lookup {
+            self.handle_options(&req).await.unwrap_or(Self::not_found_error(message.clone()).unwrap_err().into());
+            return Self::not_found_error(message.to_string()).unwrap_err().into()
+        }
+        let lookup = lookup.unwrap();
+        let upgrade = lookup.value.upgrade;
+        if self.is_query && upgrade {
+            let mut err: RawHttpResponse =
+                Self::internal_server_error().unwrap_err().into();
+            err.set_upgrade(upgrade);
+            return err
+        }
+        return self
+            .build_and_execute_request(req.clone(), path, lookup, upgrade)
+            .await
+        }
 }
