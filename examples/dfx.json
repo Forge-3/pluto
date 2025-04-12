@@ -3,24 +3,28 @@
     "http_server": {
       "candid": "src/http_server/http_server.did",
       "package": "http_server",
-      "type": "rust"
+      "type": "rust",
+      "frontend": {}
     },
     "http_server_cors": {
       "candid": "src/http_server_cors/http_server_cors.did",
       "package": "http_server_cors",
-      "type": "rust"
+      "type": "rust",
+      "frontend": {}
     },
     "http_server_body_validation": {
       "candid": "src/http_server_body_validation/http_server_body_validation.did",
       "package": "http_server_body_validation",
       "optimize": "cycles",
-      "type": "rust"
+      "type": "rust",
+      "frontend": {}
     },
     "http_server_html_template": {
       "candid": "src/http_server_html_template/http_server_html_template.did",
       "package": "http_server_html_template",
       "optimize": "size",
-      "type": "rust"
+      "type": "rust",
+      "frontend": {}
     }
   },
   "defaults": {

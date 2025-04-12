@@ -8,6 +8,7 @@ use matchit::{Match, Params as MatchitParams};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, str::FromStr};
+use url::Url;
 
 /// HeaderField is the type of the header of the request.
 #[derive(CandidType, Deserialize, Clone)]
@@ -34,6 +35,7 @@ impl From<RawHttpRequest> for HttpRequest {
             headers: req.headers,
             body: req.body.clone(),
             params: HashMap::new(),
+            query: HashMap::new(),
             path: String::new(),
         }
     }
@@ -50,6 +52,7 @@ pub struct HttpRequest {
     #[serde(with = "serde_bytes")]
     pub body: Vec<u8>,
     pub params: HashMap<String, String>,
+    pub query: HashMap<String, String>,
     pub path: String,
 }
 
@@ -119,12 +122,14 @@ pub enum HttpBody {
 
 impl HttpBody {
     pub fn empty() -> Self {
-        return Self::Raw(Vec::new())
+        return Self::Raw(Vec::new());
     }
 }
 
 impl Default for HttpBody {
-    fn default() -> Self {Self::Raw(Vec::new())}
+    fn default() -> Self {
+        Self::Raw(Vec::new())
+    }
 }
 
 impl From<HttpBody> for Vec<u8> {
@@ -400,12 +405,17 @@ impl HttpServe {
     async fn build_and_execute_request(
         self,
         req: RawHttpRequest,
+        parsed_url: Url,
         path: &str,
         lookup: Match<'_, '_, &HandlerContainer>,
         upgrade: bool,
     ) -> RawHttpResponse {
         let mut req: HttpRequest = req.into();
-        req.path = String::from(path);
+        req.path = path.to_string();
+        req.query = querystring::querify(parsed_url.query().unwrap_or(""))
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
         req.params = Self::params_to_string(lookup.params);
         let handle_res = lookup.value.handler.handle(req).await;
         let mut res = Self::unwrap_response(handle_res);
@@ -470,7 +480,7 @@ impl HttpServe {
         self.cors_policy = Some(cors_policy);
     }
 
-    pub async fn handle_options(self, req: &RawHttpRequest) -> Option<RawHttpResponse>{
+    pub async fn handle_options(self, req: &RawHttpRequest) -> Option<RawHttpResponse> {
         let router_clone = self.router.clone();
         let path = Self::get_path(&req.url);
         let allow = router_clone.allowed(path);
@@ -483,8 +493,7 @@ impl HttpServe {
             Some(ref handler) => {
                 let req = req.clone().into();
                 let handle_res = handler.handler.handle(req).await;
-                let mut raw_res =
-                    Into::<RawHttpResponse>::into(Self::unwrap_response(handle_res));
+                let mut raw_res = Into::<RawHttpResponse>::into(Self::unwrap_response(handle_res));
                 raw_res.set_upgrade(handler.upgrade);
                 Some(raw_res)
             }
@@ -496,10 +505,8 @@ impl HttpServe {
                 };
                 self.use_res_plugins(&mut res);
                 if res.headers.get("Access-Control-Allow-Methods").is_none() {
-                    res.headers.insert(
-                        "Access-Control-Allow-Methods".to_string(),
-                        allow.join(","),
-                    );
+                    res.headers
+                        .insert("Access-Control-Allow-Methods".to_string(), allow.join(","));
                 }
 
                 return Some(res.into());
@@ -538,26 +545,35 @@ impl HttpServe {
     pub async fn serve(self, req: RawHttpRequest) -> RawHttpResponse {
         let method = Method::from_str(req.method.as_ref());
         if method.is_err() {
-            return Self::internal_server_error().unwrap_err().into()
+            return Self::internal_server_error().unwrap_err().into();
         }
         let method = method.unwrap();
         let path = Self::get_path(&req.url);
         let router = self.router.clone();
         let lookup = router.lookup(method, path);
         if let Err(message) = &lookup {
-            self.handle_options(&req).await.unwrap_or(Self::not_found_error(message.clone()).unwrap_err().into());
-            return Self::not_found_error(message.to_string()).unwrap_err().into()
+            self.handle_options(&req)
+                .await
+                .unwrap_or(Self::not_found_error(message.clone()).unwrap_err().into());
+            return Self::not_found_error(message.to_string())
+                .unwrap_err()
+                .into();
         }
         let lookup = lookup.unwrap();
         let upgrade = lookup.value.upgrade;
         if self.is_query && upgrade {
-            let mut err: RawHttpResponse =
-                Self::internal_server_error().unwrap_err().into();
+            let mut err: RawHttpResponse = Self::internal_server_error().unwrap_err().into();
             err.set_upgrade(upgrade);
-            return err
+            return err;
         }
+        let temp_url = format!("{}{}", "http://localhost", req.url);
+        let parsed_url = Url::parse(&temp_url);
+        if parsed_url.is_err() {
+            return Self::internal_server_error().unwrap_err().into();
+        }
+        
         return self
-            .build_and_execute_request(req.clone(), path, lookup, upgrade)
-            .await
-        }
+            .build_and_execute_request(req.clone(), parsed_url.unwrap(), path, lookup, upgrade)
+            .await;
+    }
 }
