@@ -11,7 +11,7 @@ use std::{collections::HashMap, str::FromStr};
 use url::Url;
 
 /// HeaderField is the type of the header of the request.
-#[derive(CandidType, Deserialize, Clone)]
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct HeaderField(String, String);
 
 /// RawHttpRequest is the request type that is sent by the client.
@@ -37,11 +37,12 @@ impl From<RawHttpRequest> for HttpRequest {
             params: HashMap::new(),
             query: HashMap::new(),
             path: String::new(),
+            fragment: Some(String::new()),
         }
     }
 }
 
-#[derive(CandidType, Deserialize, Clone)]
+#[derive(CandidType, Deserialize, Clone, Debug)]
 /// HttpRequest is the request type that is available in handler.
 /// It is a more user-friendly version of RawHttpRequest
 /// It is used in handler to allow user to process the request.
@@ -54,6 +55,7 @@ pub struct HttpRequest {
     pub params: HashMap<String, String>,
     pub query: HashMap<String, String>,
     pub path: String,
+    pub fragment: Option<String>,
 }
 
 impl HttpRequest {
@@ -414,6 +416,7 @@ impl HttpServe {
         req.path = path.to_string();
         req.query = parsed_url.query_pairs().into_iter().map(|(key, value)| (key.to_string(), value.to_string())).collect();
         req.params = Self::params_to_string(lookup.params);
+        req.fragment = parsed_url.fragment().map(|str| str.to_string());
         let handle_res = lookup.value.handler.handle(req).await;
         let mut res = Self::unwrap_response(handle_res);
         self.use_res_plugins(&mut res);
