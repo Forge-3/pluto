@@ -38,7 +38,9 @@ pub(crate) fn setup() -> Router {
             .into(),
         })
     });
-    router.get("/", false, |_req: HttpRequest| async move {
+    router.get("/", false, |req: HttpRequest| async move {
+        println!("Hello World from PUT {:?}", req.params);
+
         Ok(HttpResponse {
             status_code: 200,
             headers: HashMap::new(),
