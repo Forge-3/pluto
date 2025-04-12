@@ -412,10 +412,7 @@ impl HttpServe {
     ) -> RawHttpResponse {
         let mut req: HttpRequest = req.into();
         req.path = path.to_string();
-        req.query = querystring::querify(parsed_url.query().unwrap_or(""))
-            .iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect();
+        req.query = parsed_url.query_pairs().into_iter().map(|(key, value)| (key.to_string(), value.to_string())).collect();
         req.params = Self::params_to_string(lookup.params);
         let handle_res = lookup.value.handler.handle(req).await;
         let mut res = Self::unwrap_response(handle_res);

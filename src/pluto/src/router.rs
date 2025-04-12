@@ -117,7 +117,7 @@ impl Router {
         &'a self,
         method: Method,
         path: &'a str,
-    ) -> Result<Match<&HandlerContainer>, String> {
+    ) -> Result<Match<&'a HandlerContainer>, String> {
         if let Some(tree_at_path) = self.trees.get(&method) {
             if let Ok(match_result) = tree_at_path.at(path) {
                 return Ok(match_result);
