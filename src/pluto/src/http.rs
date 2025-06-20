@@ -372,9 +372,7 @@ impl HttpServe {
     fn get_path(url: &str) -> &str {
         let mut path = url.split('?').next().unwrap_or("");
         if path.ends_with("/") {
-            let mut chars = path.chars();
-            chars.next_back();
-            path = chars.as_str();
+            path = &path[..path.len() - 1];
         }
         path
     }

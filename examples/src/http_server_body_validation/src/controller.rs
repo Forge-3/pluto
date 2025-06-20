@@ -54,7 +54,7 @@ pub(crate) fn setup() -> Router {
      *
      * For validation we recommend using the library https://crates.io/crates/validator
      */
-    router.get("/:a/:b/:c", false, |req: HttpRequest| async move {
+    router.get("/{a}/{b}/{c}", false, |req: HttpRequest| async move {
         #[derive(Deserialize, Serialize, Eq, PartialEq, Debug, Validate)]
         struct Params {
             #[validate(range(min = 18, max = 20))]
