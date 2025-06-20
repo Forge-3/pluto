@@ -17,3 +17,4 @@ validator = { workspace = true }
 serde-aux = { workspace = true }
 serde_bytes = { workspace = true }
 ic-pluto = { path = "../../../src/pluto" }
+ic-http-certification = { workspace = true }

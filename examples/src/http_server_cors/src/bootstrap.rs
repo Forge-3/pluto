@@ -45,6 +45,7 @@ async fn http_request_update(req: RawHttpRequest) -> RawHttpResponse {
 
 async fn bootstrap(mut app: HttpServe, req: RawHttpRequest) -> RawHttpResponse {
     let router = ROUTER.with(|r| r.borrow().clone());
+    let cert_tree = CERT_TREE.with(|c| c.clone());
     let cors = Cors::new()
         .allow_origin("*")
         .allow_methods(vec![Method::POST, Method::PUT])
