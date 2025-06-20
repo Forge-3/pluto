@@ -9,10 +9,22 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, str::FromStr};
 use url::Url;
+use std::rc::Rc;
+use std::cell::RefCell;
+use ic_http_certification::{utils::add_v2_certificate_header, HttpCertification, DefaultCelBuilder, StatusCode,
+    HttpResponse as HttpCertificationResponse, DefaultResponseCertification, HttpCertificationTree, HttpCertificationTreeEntry, 
+    HttpCertificationPath, CERTIFICATE_EXPRESSION_HEADER_NAME};
+use crate::path::{is_dynamic_path, extract_wildcard_prefix, get_parent_path};
 
 /// HeaderField is the type of the header of the request.
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct HeaderField(String, String);
+
+impl From<HeaderField> for (String, String) {
+    fn from(header: HeaderField) -> Self {
+        (header.0, header.1)
+    }
+}
 
 /// RawHttpRequest is the request type that is sent by the client.
 /// It is a raw version of HttpRequest. It is compatible with the Candid type.
@@ -42,10 +54,10 @@ impl From<RawHttpRequest> for HttpRequest {
     }
 }
 
-#[derive(CandidType, Deserialize, Clone, Debug)]
 /// HttpRequest is the request type that is available in handler.
 /// It is a more user-friendly version of RawHttpRequest
 /// It is used in handler to allow user to process the request.
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct HttpRequest {
     pub method: String,
     pub url: String,
@@ -310,6 +322,7 @@ pub struct HttpServe {
     router: Router,
     cors_policy: Option<Cors>,
     is_query: bool,
+    certification_tree: Option<Rc<RefCell<HttpCertificationTree>>>,
 }
 
 impl HttpServe {
@@ -323,6 +336,7 @@ impl HttpServe {
             router: Router::new(),
             cors_policy: None,
             is_query: created_in_query,
+            certification_tree: None,
         }
     }
 
@@ -336,12 +350,18 @@ impl HttpServe {
             router: r,
             cors_policy: None,
             is_query: created_in_query,
+            certification_tree: None, 
         }
     }
 
     /// Set the router of the HttpServe.
     pub fn set_router(&mut self, r: Router) {
         self.router = r;
+    }
+
+    /// Set the certification tree of the HttpServe.
+    pub fn set_certification_tree(&mut self, cert_tree: Rc<RefCell<HttpCertificationTree>>) {
+        self.certification_tree = Some(cert_tree);
     }
 
     /// Add a handler to the router.
@@ -389,9 +409,7 @@ impl HttpServe {
     fn get_path(url: &str) -> &str {
         let mut path = url.split('?').next().unwrap_or("");
         if path.ends_with("/") {
-            let mut chars = path.chars();
-            chars.next_back();
-            path = chars.as_str();
+            path = &path[..path.len() - 1];
         }
         path
     }
@@ -575,5 +593,131 @@ impl HttpServe {
         return self
             .build_and_execute_request(req.clone(), parsed_url.unwrap(), path, lookup, upgrade)
             .await;
+    }
+
+    pub async fn serve_with_cert(self, req: RawHttpRequest) -> RawHttpResponse {
+        let cert_tree = self.certification_tree.clone();
+        let is_query = self.is_query;
+        let mut path = HttpServe::get_path(&req.url);
+
+        //TODO make serve() return is_exact_path or something better
+        let method = Method::from_str(req.method.as_ref()).unwrap_or(Method::GET); 
+        let router = self.router.clone();
+        let lookup = router.lookup(method, path);
+        let is_exact_path = match &lookup {
+            Ok(lookup) => lookup.params.is_empty(),
+            _ => false,
+        };
+
+        let mut response = self.serve(req.clone()).await;
+        if !is_query {
+            return response;
+        }
+
+        let cel_expr = DefaultCelBuilder::response_only_certification()
+            .with_response_certification(DefaultResponseCertification::response_header_exclusions(vec![]))
+            .build();
+        let cel_expr_header = if is_exact_path {
+            cel_expr.to_string()
+        } else {
+            DefaultCelBuilder::skip_certification().to_string()
+        };
+        
+        response.headers.insert(
+            CERTIFICATE_EXPRESSION_HEADER_NAME.to_string(),
+            cel_expr_header,
+        );
+
+        let status_code = StatusCode::from_u16(response.status_code).unwrap();
+        let mut http_response = HttpCertificationResponse::builder()
+            .with_status_code(status_code)
+            .with_headers(response.headers.clone().into_iter().map(Into::into).collect())
+            .with_body(response.body.clone())
+            .with_upgrade(response.upgrade.unwrap())
+            .build();      
+
+        if path.is_empty() {
+            path = "/";
+        }
+        let cert_path = if is_exact_path {
+            HttpCertificationPath::exact(path)
+        } else {
+            HttpCertificationPath::wildcard(get_parent_path(path))
+        };
+
+        let certification = if is_exact_path {
+            HttpCertification::response_only(&cel_expr, &http_response, None).unwrap()
+        } else {
+            HttpCertification::skip()
+        };
+
+        let entry = HttpCertificationTreeEntry::new(cert_path, certification);
+        let cert_tree_rc = match cert_tree {
+            Some(tree) => tree,
+            None => {
+                ic_cdk::println!("[serve] No certification_tree set");
+                return Self::internal_server_error().unwrap_err().into();
+            }
+        };
+
+        let witness = cert_tree_rc
+            .borrow()
+            .witness(&entry, &path)
+            .expect("Failed to get witness for certification entry");
+        
+        add_v2_certificate_header(
+            &ic_cdk::api::data_certificate().expect("No data certificate available"),
+            &mut http_response,
+            &witness,
+            &entry.path.to_expr_path(),
+        );
+
+        response.headers = http_response.headers().into_iter().cloned().collect();
+        response
+    }
+
+    pub fn generate_certification_entry<'a>(
+        req_url: &'a str,
+        response: &'a mut RawHttpResponse,
+    ) -> HttpCertificationTreeEntry<'a> {
+        let cel_expr = DefaultCelBuilder::response_only_certification()
+            .with_response_certification(DefaultResponseCertification::response_header_exclusions(
+                vec![],
+            ))
+            .build();
+
+        response.headers.insert(
+            CERTIFICATE_EXPRESSION_HEADER_NAME.to_string(),
+            cel_expr.to_string(),
+        );
+
+        let mut path: &str = HttpServe::get_path(req_url);
+        if path.is_empty() {
+            path = "/";
+        }
+
+        let cert_path = if is_dynamic_path(&path) {
+            let prefix = extract_wildcard_prefix(&path);
+            HttpCertificationPath::wildcard(prefix)
+        } else {
+            HttpCertificationPath::exact(path)
+        };
+
+        let status_code = StatusCode::from_u16(response.status_code).unwrap();
+        let http_response = HttpCertificationResponse::builder()
+            .with_status_code(status_code)
+            .with_headers(response.headers.clone().into_iter().map(Into::into).collect())
+            .with_body(response.body.clone())
+            .with_upgrade(response.upgrade.unwrap())
+            .build();
+
+        let certification = if is_dynamic_path(&path) {
+            HttpCertification::skip()
+        } else {
+            HttpCertification::response_only(&cel_expr, &http_response, None).unwrap()
+        };
+
+        let entry = HttpCertificationTreeEntry::new(cert_path, certification.clone());
+        entry
     }
 }

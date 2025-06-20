@@ -2,7 +2,11 @@ use std::{collections::HashMap, future::Future, pin::Pin};
 
 use dyn_clone::{clone_trait_object, DynClone};
 use matchit::{Match, Router as MatchRouter};
-
+use std::rc::Rc;
+use std::cell::RefCell;
+use ic_http_certification::HttpCertificationTree;
+use crate::http::RawHttpRequest;
+use crate::http::HttpServe;
 use crate::{
     http::{HttpRequest, HttpResponse},
     method::Method,
@@ -23,6 +27,7 @@ pub struct Router {
     trees: HashMap<Method, MatchRouter<HandlerContainer>>,
     pub(crate) handle_options: bool,
     pub(crate) global_options: Option<HandlerContainer>,
+    registered: Vec<(Method, String)>,
 }
 
 impl Router {
@@ -42,6 +47,7 @@ impl Router {
             trees: HashMap::new(),
             handle_options: true,
             global_options: None,
+            registered: Vec::new(),
         }
     }
 
@@ -98,8 +104,8 @@ impl Router {
             global_path.pop();
         }
 
-        match self.trees.entry(method).or_default().insert(
-            global_path,
+        match self.trees.entry(method.clone()).or_default().insert(
+            global_path.clone(),
             HandlerContainer {
                 handler: Box::new(handler),
                 upgrade: upgrade,
@@ -108,6 +114,7 @@ impl Router {
             Err(err) => panic!("\nERROR: {}\n", err),
             Ok(_) => {}
         }
+        self.registered.push((method, global_path.clone()));
         self
     }
 
@@ -464,6 +471,34 @@ impl Router {
         }
 
         allowed
+    }
+
+    pub async fn certify_get_responses(
+        &self,
+        cert_tree: Rc<RefCell<HttpCertificationTree>>,
+    ) {
+        for (method, path) in &self.registered {
+            if *method != Method::GET {
+                continue;
+            }
+
+            let raw_request = RawHttpRequest {
+                method: method.as_ref().to_string(),
+                url: path.to_string(),
+                headers: vec![],
+                body: vec![],
+            };
+            
+            let mut serve = HttpServe::new("http_request"); // query = GET requests
+            serve.set_router(self.clone());
+            serve.set_certification_tree(cert_tree.clone());
+
+            let mut response = serve.serve(raw_request.clone()).await;
+            let entry = HttpServe::generate_certification_entry(&raw_request.url, &mut response);
+            cert_tree.borrow_mut().insert(&entry);
+        }
+        let cert_tree_temp = cert_tree.borrow();
+        ic_cdk::api::set_certified_data(&cert_tree_temp.root_hash());
     }
 }
 
