@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use ic_http_certification::{utils::add_v2_certificate_header, HttpCertification, DefaultCelBuilder, StatusCode,
     HttpResponse as HttpCertificationResponse, DefaultResponseCertification, HttpCertificationTree, HttpCertificationTreeEntry, 
     HttpCertificationPath, CERTIFICATE_EXPRESSION_HEADER_NAME};
-use crate::path::{is_dynamic_path, extract_wildcard_prefix, get_parent_path};
+use crate::path::{is_dynamic_path, extract_wildcard_prefix, wildcard_base_path};
 
 /// HeaderField is the type of the header of the request.
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -439,10 +439,6 @@ impl HttpServe {
                 .insert(&entry);
         }
         let cert_tree_temp = cert_tree.clone();
-        ic_cdk::println!(
-            "[add_get_responses_to_tree] Certification tree root hash: {:?}",
-            cert_tree_temp.borrow().root_hash()
-        );
         ic_cdk::api::certified_data_set(&cert_tree_temp.borrow().root_hash());
     }
 
@@ -640,14 +636,10 @@ impl HttpServe {
         let is_query = self.is_query;
         let mut path = HttpServe::get_path(&req.url);
 
-        //TODO make serve() return is_exact_path or something better
         let method = Method::from_str(req.method.as_ref()).unwrap_or(Method::GET); 
         let router = self.router.clone();
         let lookup = router.lookup(method, path);
-        let is_exact_path = match &lookup {
-            Ok(lookup) => lookup.params.is_empty(),
-            _ => false,
-        };
+        let wild_path = wildcard_base_path(&path, &lookup);
 
         let mut response = self.serve(req.clone()).await;
         if !is_query {
@@ -657,7 +649,7 @@ impl HttpServe {
         let cel_expr = DefaultCelBuilder::response_only_certification()
             .with_response_certification(DefaultResponseCertification::response_header_exclusions(vec![]))
             .build();
-        let cel_expr_header = if is_exact_path {
+        let cel_expr_header = if wild_path.is_empty() {
             cel_expr.to_string()
         } else {
             DefaultCelBuilder::skip_certification().to_string()
@@ -679,13 +671,13 @@ impl HttpServe {
         if path.is_empty() {
             path = "/";
         }
-        let cert_path = if is_exact_path {
+        let cert_path = if wild_path.is_empty() {
             HttpCertificationPath::exact(path)
         } else {
-            HttpCertificationPath::wildcard(get_parent_path(path))
+            HttpCertificationPath::wildcard(&wild_path)
         };
 
-        let certification = if is_exact_path {
+        let certification = if wild_path.is_empty() {
             HttpCertification::response_only(&cel_expr, &http_response, None).unwrap()
         } else {
             HttpCertification::skip()

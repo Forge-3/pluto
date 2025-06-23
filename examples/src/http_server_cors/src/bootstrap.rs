@@ -49,7 +49,6 @@ async fn bootstrap(mut app: HttpServe, req: RawHttpRequest) -> RawHttpResponse {
     app.set_router(router);
     app.use_cors(cors);
     app.set_certification_tree(cert_tree);
-    
 
     app.serve_with_cert(req).await
 }
