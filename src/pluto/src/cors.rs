@@ -1,7 +1,7 @@
 use crate::{all_or_some::AllOrSome, http::HttpResponse, method::Method};
 use std::ops::Deref;
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Eq, Clone, PartialEq, Debug)]
 pub struct Cors {
     allow_origin: Option<AllOrSome<String>>,
     allow_methods: Vec<Method>,

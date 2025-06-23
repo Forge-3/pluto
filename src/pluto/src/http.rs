@@ -406,6 +406,46 @@ impl HttpServe {
         });
     }
 
+    pub async fn add_get_responses_to_tree(&self) {
+        let Some(cert_tree) = &self.certification_tree else {
+            ic_cdk::println!("[add_get_responses_to_tree] No certification_tree set");
+            return;
+        };
+
+        for (method, path) in &self.router.registered {
+            if *method != Method::GET {
+                continue;
+            }
+
+            let raw_request = RawHttpRequest {
+                method: method.as_ref().to_string(),
+                url: path.to_string(),
+                headers: vec![],
+                body: vec![],
+            };
+
+            let mut app = HttpServe::new("http_request");
+            app.set_router(self.router.clone());
+            app.set_certification_tree(cert_tree.clone());
+            if let Some(cors) = &self.cors_policy {
+                app.use_cors(cors.clone());
+            }
+
+            let mut response = app.serve(raw_request.clone()).await;
+            let entry = HttpServe::generate_certification_entry(&raw_request.url, &mut response);
+
+            cert_tree
+                .borrow_mut()
+                .insert(&entry);
+        }
+        let cert_tree_temp = cert_tree.clone();
+        ic_cdk::println!(
+            "[add_get_responses_to_tree] Certification tree root hash: {:?}",
+            cert_tree_temp.borrow().root_hash()
+        );
+        ic_cdk::api::certified_data_set(&cert_tree_temp.borrow().root_hash());
+    }
+
     fn get_path(url: &str) -> &str {
         let mut path = url.split('?').next().unwrap_or("");
         if path.ends_with("/") {

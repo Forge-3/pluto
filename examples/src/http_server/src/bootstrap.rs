@@ -17,17 +17,12 @@ thread_local! {
 // System functions
 #[init]
 async fn init() {
-    let cert_tree = CERT_TREE.with(|c| c.clone());
-    let router = ROUTER.with(|r| r.borrow().clone());
-    router.certify_get_responses(cert_tree).await;
+    bootstrap_setup().await;
 }
 
 #[post_upgrade]
 async fn post_upgrade() {
-    let router = controller::setup();
-    let cert_tree = CERT_TREE.with(|c| c.clone());
-    router.certify_get_responses(cert_tree.clone()).await;
-    ROUTER.with(|r| *r.borrow_mut() = router);
+    bootstrap_setup().await;
 }
 
 // Http interface
@@ -47,4 +42,13 @@ async fn bootstrap(mut app: HttpServe, req: RawHttpRequest) -> RawHttpResponse {
     app.set_router(router);
     app.set_certification_tree(cert_tree);
     app.serve_with_cert(req).await
+}
+
+async fn bootstrap_setup() {
+    let router = ROUTER.with(|r| r.borrow().clone());
+    let cert_tree = CERT_TREE.with(|c| c.clone());
+    let mut app = HttpServe::new("http_request");
+    app.set_router(router);
+    app.set_certification_tree(cert_tree);
+    app.add_get_responses_to_tree().await;
 }
