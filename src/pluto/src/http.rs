@@ -8,10 +8,23 @@ use matchit::{Match, Params as MatchitParams};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, str::FromStr};
+use url::Url;
+use std::rc::Rc;
+use std::cell::RefCell;
+use ic_http_certification::{utils::add_v2_certificate_header, HttpCertification, DefaultCelBuilder, StatusCode,
+    HttpResponse as HttpCertificationResponse, DefaultResponseCertification, HttpCertificationTree, HttpCertificationTreeEntry, 
+    HttpCertificationPath, CERTIFICATE_EXPRESSION_HEADER_NAME};
+use crate::path::{is_dynamic_path, extract_wildcard_prefix, wildcard_base_path};
 
 /// HeaderField is the type of the header of the request.
-#[derive(CandidType, Deserialize, Clone)]
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct HeaderField(String, String);
+
+impl From<HeaderField> for (String, String) {
+    fn from(header: HeaderField) -> Self {
+        (header.0, header.1)
+    }
+}
 
 /// RawHttpRequest is the request type that is sent by the client.
 /// It is a raw version of HttpRequest. It is compatible with the Candid type.
@@ -34,15 +47,17 @@ impl From<RawHttpRequest> for HttpRequest {
             headers: req.headers,
             body: req.body.clone(),
             params: HashMap::new(),
+            query: HashMap::new(),
             path: String::new(),
+            fragment: Some(String::new()),
         }
     }
 }
 
-#[derive(CandidType, Deserialize, Clone)]
 /// HttpRequest is the request type that is available in handler.
 /// It is a more user-friendly version of RawHttpRequest
 /// It is used in handler to allow user to process the request.
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct HttpRequest {
     pub method: String,
     pub url: String,
@@ -50,7 +65,9 @@ pub struct HttpRequest {
     #[serde(with = "serde_bytes")]
     pub body: Vec<u8>,
     pub params: HashMap<String, String>,
+    pub query: HashMap<String, String>,
     pub path: String,
+    pub fragment: Option<String>,
 }
 
 impl HttpRequest {
@@ -115,6 +132,18 @@ pub enum HttpBody {
     Value(Value),
     String(String),
     Raw(Vec<u8>),
+}
+
+impl HttpBody {
+    pub fn empty() -> Self {
+        return Self::Raw(Vec::new());
+    }
+}
+
+impl Default for HttpBody {
+    fn default() -> Self {
+        Self::Raw(Vec::new())
+    }
 }
 
 impl From<HttpBody> for Vec<u8> {
@@ -293,6 +322,7 @@ pub struct HttpServe {
     router: Router,
     cors_policy: Option<Cors>,
     is_query: bool,
+    certification_tree: Option<Rc<RefCell<HttpCertificationTree>>>,
 }
 
 impl HttpServe {
@@ -306,6 +336,7 @@ impl HttpServe {
             router: Router::new(),
             cors_policy: None,
             is_query: created_in_query,
+            certification_tree: None,
         }
     }
 
@@ -319,12 +350,18 @@ impl HttpServe {
             router: r,
             cors_policy: None,
             is_query: created_in_query,
+            certification_tree: None, 
         }
     }
 
     /// Set the router of the HttpServe.
     pub fn set_router(&mut self, r: Router) {
         self.router = r;
+    }
+
+    /// Set the certification tree of the HttpServe.
+    pub fn set_certification_tree(&mut self, cert_tree: Rc<RefCell<HttpCertificationTree>>) {
+        self.certification_tree = Some(cert_tree);
     }
 
     /// Add a handler to the router.
@@ -369,12 +406,46 @@ impl HttpServe {
         });
     }
 
+    pub async fn add_get_responses_to_tree(&self) {
+        let Some(cert_tree) = &self.certification_tree else {
+            ic_cdk::println!("[add_get_responses_to_tree] No certification_tree set");
+            return;
+        };
+
+        for (method, path) in &self.router.registered {
+            if *method != Method::GET {
+                continue;
+            }
+
+            let raw_request = RawHttpRequest {
+                method: method.as_ref().to_string(),
+                url: path.to_string(),
+                headers: vec![],
+                body: vec![],
+            };
+
+            let mut app = HttpServe::new("http_request");
+            app.set_router(self.router.clone());
+            app.set_certification_tree(cert_tree.clone());
+            if let Some(cors) = &self.cors_policy {
+                app.use_cors(cors.clone());
+            }
+
+            let mut response = app.serve(raw_request.clone()).await;
+            let entry = HttpServe::generate_certification_entry(&raw_request.url, &mut response);
+
+            cert_tree
+                .borrow_mut()
+                .insert(&entry);
+        }
+        let cert_tree_temp = cert_tree.clone();
+        ic_cdk::api::certified_data_set(&cert_tree_temp.borrow().root_hash());
+    }
+
     fn get_path(url: &str) -> &str {
         let mut path = url.split('?').next().unwrap_or("");
         if path.ends_with("/") {
-            let mut chars = path.chars();
-            chars.next_back();
-            path = chars.as_str();
+            path = &path[..path.len() - 1];
         }
         path
     }
@@ -390,13 +461,16 @@ impl HttpServe {
     async fn build_and_execute_request(
         self,
         req: RawHttpRequest,
+        parsed_url: Url,
         path: &str,
         lookup: Match<'_, '_, &HandlerContainer>,
         upgrade: bool,
     ) -> RawHttpResponse {
         let mut req: HttpRequest = req.into();
-        req.path = String::from(path);
+        req.path = path.to_string();
+        req.query = parsed_url.query_pairs().into_iter().map(|(key, value)| (key.to_string(), value.to_string())).collect();
         req.params = Self::params_to_string(lookup.params);
+        req.fragment = parsed_url.fragment().map(|str| str.to_string());
         let handle_res = lookup.value.handler.handle(req).await;
         let mut res = Self::unwrap_response(handle_res);
         self.use_res_plugins(&mut res);
@@ -460,6 +534,40 @@ impl HttpServe {
         self.cors_policy = Some(cors_policy);
     }
 
+    pub async fn handle_options(self, req: &RawHttpRequest) -> Option<RawHttpResponse> {
+        let router_clone = self.router.clone();
+        let path = Self::get_path(&req.url);
+        let allow = router_clone.allowed(path);
+
+        if allow.is_empty() {
+            return None;
+        }
+
+        return match self.router.global_options {
+            Some(ref handler) => {
+                let req = req.clone().into();
+                let handle_res = handler.handler.handle(req).await;
+                let mut raw_res = Into::<RawHttpResponse>::into(Self::unwrap_response(handle_res));
+                raw_res.set_upgrade(handler.upgrade);
+                Some(raw_res)
+            }
+            None => {
+                let mut res = HttpResponse {
+                    status_code: 204,
+                    headers: HashMap::new(),
+                    body: HttpBody::default(),
+                };
+                self.use_res_plugins(&mut res);
+                if res.headers.get("Access-Control-Allow-Methods").is_none() {
+                    res.headers
+                        .insert("Access-Control-Allow-Methods".to_string(), allow.join(","));
+                }
+
+                return Some(res.into());
+            }
+        };
+    }
+
     /// Serve the request.
     /// It will return a RawHttpResponse.
     /// It will return an internal server error if the request is not valid.
@@ -489,65 +597,159 @@ impl HttpServe {
     /// }
     /// ```
     pub async fn serve(self, req: RawHttpRequest) -> RawHttpResponse {
-        match Method::from_str(req.method.as_ref()) {
-            Err(_) => Self::internal_server_error().unwrap_err().into(),
-            Ok(method) => {
-                let path = Self::get_path(req.url.as_ref());
-                match self.router.clone().lookup(method, path) {
-                    Err(message) => {
-                        // Handle OPTIONS request
-                        if req.method == Method::OPTIONS.to_string() && self.router.handle_options {
-                            let router_clone = self.router.clone();
-                            let allow = router_clone.allowed(path);
-
-                            if !allow.is_empty() {
-                                return match self.router.global_options {
-                                    Some(ref handler) => {
-                                        let handle_res = handler.handler.handle(req.into()).await;
-                                        let mut raw_res: RawHttpResponse =
-                                            Self::unwrap_response(handle_res).into();
-                                        raw_res.set_upgrade(handler.upgrade);
-                                        raw_res
-                                    }
-                                    None => {
-                                        let mut res = HttpResponse {
-                                            status_code: 204,
-                                            headers: HashMap::new(),
-                                            body: "".to_string().into(),
-                                        };
-                                        self.use_res_plugins(&mut res);
-                                        if let None =
-                                            res.headers.get("Access-Control-Allow-Methods")
-                                        {
-                                            res.headers.insert(
-                                                "Access-Control-Allow-Methods".to_string(),
-                                                allow.join(","),
-                                            );
-                                        }
-
-                                        return res.into();
-                                    }
-                                };
-                            }
-                        }
-
-                        return Self::not_found_error(message).unwrap_err().into();
-                    }
-                    Ok(lookup) => {
-                        let upgrade = lookup.value.upgrade;
-                        if self.is_query && upgrade {
-                            let mut err: RawHttpResponse =
-                                Self::internal_server_error().unwrap_err().into();
-                            err.set_upgrade(upgrade);
-                            return err;
-                        }
-                        let res = self
-                            .build_and_execute_request(req.clone(), path, lookup, upgrade)
-                            .await;
-                        return res;
-                    }
-                }
-            }
+        let method = Method::from_str(req.method.as_ref());
+        if method.is_err() {
+            return Self::internal_server_error().unwrap_err().into();
         }
+        let method = method.unwrap();
+        let path = Self::get_path(&req.url);
+        let router = self.router.clone();
+        let lookup = router.lookup(method, path);
+        if let Err(message) = &lookup {
+            self.handle_options(&req)
+                .await
+                .unwrap_or(Self::not_found_error(message.clone()).unwrap_err().into());
+            return Self::not_found_error(message.to_string())
+                .unwrap_err()
+                .into();
+        }
+        let lookup = lookup.unwrap();
+        let upgrade = lookup.value.upgrade;
+        if self.is_query && upgrade {
+            let mut err: RawHttpResponse = Self::internal_server_error().unwrap_err().into();
+            err.set_upgrade(upgrade);
+            return err;
+        }
+        let temp_url = format!("{}{}", "http://localhost", req.url);
+        let parsed_url = Url::parse(&temp_url);
+        if parsed_url.is_err() {
+            return Self::internal_server_error().unwrap_err().into();
+        }
+        
+        return self
+            .build_and_execute_request(req.clone(), parsed_url.unwrap(), path, lookup, upgrade)
+            .await;
+    }
+
+    pub async fn serve_with_cert(self, req: RawHttpRequest) -> RawHttpResponse {
+        let cert_tree = self.certification_tree.clone();
+        let is_query = self.is_query;
+        let mut path = HttpServe::get_path(&req.url);
+
+        let method = Method::from_str(req.method.as_ref()).unwrap_or(Method::GET); 
+        let router = self.router.clone();
+        let lookup = router.lookup(method, path);
+        let wild_path = wildcard_base_path(&path, &lookup);
+
+        let mut response = self.serve(req.clone()).await;
+        if !is_query {
+            return response;
+        }
+
+        let cel_expr = DefaultCelBuilder::response_only_certification()
+            .with_response_certification(DefaultResponseCertification::response_header_exclusions(vec![]))
+            .build();
+        let cel_expr_header = if wild_path.is_empty() {
+            cel_expr.to_string()
+        } else {
+            DefaultCelBuilder::skip_certification().to_string()
+        };
+        
+        response.headers.insert(
+            CERTIFICATE_EXPRESSION_HEADER_NAME.to_string(),
+            cel_expr_header,
+        );
+
+        let status_code = StatusCode::from_u16(response.status_code).unwrap();
+        let mut http_response = HttpCertificationResponse::builder()
+            .with_status_code(status_code)
+            .with_headers(response.headers.clone().into_iter().map(Into::into).collect())
+            .with_body(response.body.clone())
+            .with_upgrade(response.upgrade.unwrap())
+            .build();      
+
+        if path.is_empty() {
+            path = "/";
+        }
+        let cert_path = if wild_path.is_empty() {
+            HttpCertificationPath::exact(path)
+        } else {
+            HttpCertificationPath::wildcard(&wild_path)
+        };
+
+        let certification = if wild_path.is_empty() {
+            HttpCertification::response_only(&cel_expr, &http_response, None).unwrap()
+        } else {
+            HttpCertification::skip()
+        };
+
+        let entry = HttpCertificationTreeEntry::new(cert_path, certification);
+        let cert_tree_rc = match cert_tree {
+            Some(tree) => tree,
+            None => {
+                ic_cdk::println!("[serve] No certification_tree set");
+                return Self::internal_server_error().unwrap_err().into();
+            }
+        };
+
+        let witness = cert_tree_rc
+            .borrow()
+            .witness(&entry, &path)
+            .expect("Failed to get witness for certification entry");
+        
+        add_v2_certificate_header(
+            &ic_cdk::api::data_certificate().expect("No data certificate available"),
+            &mut http_response,
+            &witness,
+            &entry.path.to_expr_path(),
+        );
+
+        response.headers = http_response.headers().into_iter().cloned().collect();
+        response
+    }
+
+    pub fn generate_certification_entry<'a>(
+        req_url: &'a str,
+        response: &'a mut RawHttpResponse,
+    ) -> HttpCertificationTreeEntry<'a> {
+        let cel_expr = DefaultCelBuilder::response_only_certification()
+            .with_response_certification(DefaultResponseCertification::response_header_exclusions(
+                vec![],
+            ))
+            .build();
+
+        response.headers.insert(
+            CERTIFICATE_EXPRESSION_HEADER_NAME.to_string(),
+            cel_expr.to_string(),
+        );
+
+        let mut path: &str = HttpServe::get_path(req_url);
+        if path.is_empty() {
+            path = "/";
+        }
+
+        let cert_path = if is_dynamic_path(&path) {
+            let prefix = extract_wildcard_prefix(&path);
+            HttpCertificationPath::wildcard(prefix)
+        } else {
+            HttpCertificationPath::exact(path)
+        };
+
+        let status_code = StatusCode::from_u16(response.status_code).unwrap();
+        let http_response = HttpCertificationResponse::builder()
+            .with_status_code(status_code)
+            .with_headers(response.headers.clone().into_iter().map(Into::into).collect())
+            .with_body(response.body.clone())
+            .with_upgrade(response.upgrade.unwrap())
+            .build();
+
+        let certification = if is_dynamic_path(&path) {
+            HttpCertification::skip()
+        } else {
+            HttpCertification::response_only(&cel_expr, &http_response, None).unwrap()
+        };
+
+        let entry = HttpCertificationTreeEntry::new(cert_path, certification.clone());
+        entry
     }
 }

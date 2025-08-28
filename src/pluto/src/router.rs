@@ -2,7 +2,6 @@ use std::{collections::HashMap, future::Future, pin::Pin};
 
 use dyn_clone::{clone_trait_object, DynClone};
 use matchit::{Match, Router as MatchRouter};
-
 use crate::{
     http::{HttpRequest, HttpResponse},
     method::Method,
@@ -23,6 +22,7 @@ pub struct Router {
     trees: HashMap<Method, MatchRouter<HandlerContainer>>,
     pub(crate) handle_options: bool,
     pub(crate) global_options: Option<HandlerContainer>,
+    pub(crate) registered: Vec<(Method, String)>,
 }
 
 impl Router {
@@ -42,6 +42,7 @@ impl Router {
             trees: HashMap::new(),
             handle_options: true,
             global_options: None,
+            registered: Vec::new(),
         }
     }
 
@@ -98,8 +99,8 @@ impl Router {
             global_path.pop();
         }
 
-        match self.trees.entry(method).or_default().insert(
-            global_path,
+        match self.trees.entry(method.clone()).or_default().insert(
+            global_path.clone(),
             HandlerContainer {
                 handler: Box::new(handler),
                 upgrade: upgrade,
@@ -108,6 +109,7 @@ impl Router {
             Err(err) => panic!("\nERROR: {}\n", err),
             Ok(_) => {}
         }
+        self.registered.push((method, global_path.clone()));
         self
     }
 
@@ -117,7 +119,7 @@ impl Router {
         &'a self,
         method: Method,
         path: &'a str,
-    ) -> Result<Match<&HandlerContainer>, String> {
+    ) -> Result<Match<&'a HandlerContainer>, String> {
         if let Some(tree_at_path) = self.trees.get(&method) {
             if let Ok(match_result) = tree_at_path.at(path) {
                 return Ok(match_result);

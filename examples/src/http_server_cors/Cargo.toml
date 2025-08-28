@@ -13,3 +13,4 @@ ic-cdk = { workspace = true }
 candid = { workspace = true }
 serde_json = { workspace = true }
 ic-pluto = { path = "../../../src/pluto" }
+ic-http-certification = { workspace = true }

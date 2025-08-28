@@ -10,7 +10,7 @@ use serde_json::json;
 pub(crate) fn setup() -> Router {
     let mut router = Router::new();
 
-    router.put("/:value", false, |req: HttpRequest| async move {
+    router.put("/{value}", false, |req: HttpRequest| async move {
         println!("Hello World from PUT {:?}", req.params.get("value"));
 
         Ok(HttpResponse {
@@ -38,7 +38,9 @@ pub(crate) fn setup() -> Router {
             .into(),
         })
     });
-    router.get("/", false, |_req: HttpRequest| async move {
+    router.get("/", false, |req: HttpRequest| async move {
+        println!("Hello World from GET {:?}", req.params);
+
         Ok(HttpResponse {
             status_code: 200,
             headers: HashMap::new(),
